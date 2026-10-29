@@ -45,6 +45,132 @@ PINNED_REQUIREMENTS = [
 ]
 
 
+# Project roles the Agent Runtime service agent
+# (service-<PROJECT_NUMBER>@gcp-sa-aiplatform-re.iam.gserviceaccount.com) needs so that
+# deployed Seed Pack tools can read/write BigQuery, call Gemini and use Cloud Storage.
+REASONING_ENGINE_RUNTIME_ROLES = (
+    "roles/bigquery.dataEditor",
+    "roles/bigquery.jobUser",
+    "roles/aiplatform.user",
+    "roles/storage.objectAdmin",
+)
+
+_CRM_PROJECTS_URL = "https://cloudresourcemanager.googleapis.com/v1/projects"
+_IAM_HTTP_TIMEOUT_SECONDS = 10
+_IAM_ETAG_CONFLICT_RETRIES = 2
+
+
+def _authorized_session():
+    """Return an AuthorizedSession built from Application Default Credentials."""
+    import google.auth
+    from google.auth.transport.requests import AuthorizedSession
+
+    creds, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
+    return AuthorizedSession(creds)
+
+
+def _reasoning_engine_service_agent(project_number: str) -> str:
+    return f"serviceAccount:service-{project_number}@gcp-sa-aiplatform-re.iam.gserviceaccount.com"
+
+
+def _add_runtime_bindings(policy: dict, member: str) -> bool:
+    """Additively bind `member` to every runtime role in `policy` (in place).
+
+    Only unconditional bindings (no "condition") count; conditional bindings, other
+    members, `etag` and `version` are preserved. Returns True if the policy changed.
+    """
+    bindings = policy.setdefault("bindings", [])
+    has_conditions = any("condition" in binding for binding in bindings)
+    changed = False
+    for role in REASONING_ENGINE_RUNTIME_ROLES:
+        unconditional = [b for b in bindings if b.get("role") == role and "condition" not in b]
+        if any(member in b.get("members", []) for b in unconditional):
+            continue
+        if unconditional:
+            unconditional[0].setdefault("members", []).append(member)
+        else:
+            bindings.append({"role": role, "members": [member]})
+        changed = True
+    current_version = int(policy.get("version") or 1)
+    policy["version"] = max(current_version, 3) if has_conditions else current_version
+    return changed
+
+
+def ensure_reasoning_engine_iam(project_id: str, resource_name: str) -> bool:
+    """Grant the Agent Runtime service agent the BigQuery/Vertex/Storage roles it needs.
+
+    Deployed agents run as service-<PROJECT_NUMBER>@gcp-sa-aiplatform-re.iam.gserviceaccount.com
+    instead of the developer's ADC user, so BigQuery tools that work in `make dev` get
+    403 Access Denied after `make deploy` unless these roles are bound. The update is
+    additive (read-modify-write with etag) and raises on HTTP errors such as 403.
+    """
+    project_part = parse_reasoning_engine_name(resource_name)["project"]
+    session = _authorized_session()
+    if project_part.isdigit():
+        project_number = project_part
+    else:
+        response = session.get(
+            f"{_CRM_PROJECTS_URL}/{project_id}", timeout=_IAM_HTTP_TIMEOUT_SECONDS
+        )
+        response.raise_for_status()
+        project_number = str(response.json()["projectNumber"])
+    member = _reasoning_engine_service_agent(project_number)
+
+    for attempt in range(_IAM_ETAG_CONFLICT_RETRIES + 1):
+        response = session.post(
+            f"{_CRM_PROJECTS_URL}/{project_id}:getIamPolicy",
+            json={"options": {"requestedPolicyVersion": 3}},
+            timeout=_IAM_HTTP_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        policy = response.json()
+        if not _add_runtime_bindings(policy, member):
+            print(f"[deploy] Verified BigQuery/Vertex/Storage IAM roles on {member}.")
+            return True
+        response = session.post(
+            f"{_CRM_PROJECTS_URL}/{project_id}:setIamPolicy",
+            json={"policy": policy},
+            timeout=_IAM_HTTP_TIMEOUT_SECONDS,
+        )
+        if response.status_code == 409 and attempt < _IAM_ETAG_CONFLICT_RETRIES:
+            print("[deploy] IAM policy changed concurrently (etag conflict); retrying...")
+            continue
+        response.raise_for_status()
+        print(f"[deploy] Granted BigQuery/Vertex/Storage IAM roles to {member}.")
+        return True
+    return False  # pragma: no cover - the loop always returns or raises
+
+
+def _ensure_runtime_iam_best_effort(project_id: str, resource_name: str) -> bool:
+    """Run ensure_reasoning_engine_iam but never raise: print the manual fix instead."""
+    try:
+        return ensure_reasoning_engine_iam(project_id, resource_name)
+    except Exception as exc:  # IAM is best-effort; never abort make deploy
+        try:
+            project_part = parse_reasoning_engine_name(resource_name)["project"]
+        except ValueError:
+            project_part = ""
+        number = project_part if project_part.isdigit() else "<PROJECT_NUMBER>"
+        member = _reasoning_engine_service_agent(number)
+        commands = "\n".join(
+            f"  gcloud projects add-iam-policy-binding {project_id} --member={member} --role={role}"
+            for role in ("roles/bigquery.dataEditor", "roles/bigquery.jobUser")
+        )
+        lookup = (
+            ""
+            if number != "<PROJECT_NUMBER>"
+            else f"\n(Find <PROJECT_NUMBER> with `gcloud projects describe {project_id} "
+            "--format='value(projectNumber)'`.)"
+        )
+        print(
+            f"[deploy] NOTE: could not verify/grant runtime IAM roles for the deployed agent "
+            f"({type(exc).__name__}: {exc}). The deployment itself succeeded. If the agent gets "
+            "403 Access Denied on BigQuery, ask a Project IAM Admin to run:\n"
+            f"{commands}{lookup}"
+        )
+        return False
+
+
 def _assert_python_312() -> None:
     if sys.version_info[:2] != (3, 12):
         raise RuntimeError(
@@ -221,6 +347,11 @@ def deploy_agent(
         print(f"[deploy] Creating Agent Runtime instance '{display_name}' (this takes ~3-6 minutes)...")
         remote_app = agent_engines.create(agent_engine=app, **deploy_kwargs)
         resource_name = remote_app.resource_name
+
+    if check_bucket:
+        # Best-effort: the deployed agent runs as the Agent Runtime service agent, not your
+        # ADC user. Never raises (offline unit tests pass check_bucket=False and skip it).
+        _ensure_runtime_iam_best_effort(project_id, resource_name)
 
     metadata = {
         "resource_name": resource_name,

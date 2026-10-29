@@ -111,13 +111,31 @@ def explain_gcp_error(exc: BaseException, project: str | None = None) -> str:
             "The Gemini client is not in Vertex AI mode. Set GOOGLE_GENAI_USE_VERTEXAI=1 and "
             "GOOGLE_CLOUD_PROJECT in .env."
         )
-    if "permission_denied" in lowered or "403" in lowered:
-        return (
+    if "permission_denied" in lowered or "403" in lowered or "access denied" in lowered:
+        hint = (
             f"Permission denied in project '{proj}'. Check you are using the right project "
             "(`gcloud config get-value project`), that your account has Vertex AI User, BigQuery "
             "User and Storage Admin roles, and that the quota project is set "
             f"(`gcloud auth application-default set-quota-project {proj}`)."
         )
+        if any(
+            key in lowered
+            for key in ("bigquery", "jobs.create", "dataset", "access denied: table", "gcp-sa-aiplatform-re")
+        ):
+            member = "serviceAccount:service-<PROJECT_NUMBER>@gcp-sa-aiplatform-re.iam.gserviceaccount.com"
+            hint += (
+                " If this is a deployed Agent Runtime agent (works in `make dev`, fails after "
+                "`make deploy`), it runs as service-<PROJECT_NUMBER>@gcp-sa-aiplatform-re."
+                "iam.gserviceaccount.com, not your ADC user: re-run `make deploy` with Project IAM "
+                "Admin, or grant roles/bigquery.dataEditor and roles/bigquery.jobUser:\n"
+                f"  gcloud projects add-iam-policy-binding {proj} --member={member} "
+                "--role=roles/bigquery.dataEditor\n"
+                f"  gcloud projects add-iam-policy-binding {proj} --member={member} "
+                "--role=roles/bigquery.jobUser\n"
+                f"(Find <PROJECT_NUMBER> with `gcloud projects describe {proj} "
+                "--format='value(projectNumber)'`.)"
+            )
+        return hint
     if "resource_exhausted" in lowered or "429" in lowered:
         return "Gemini quota exhausted (429). Wait 30-60 seconds and retry; avoid parallel eval runs."
     return ""

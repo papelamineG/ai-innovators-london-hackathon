@@ -216,6 +216,7 @@ ai-innovators-london-hackathon/
 | Agent returns blank reply or `KeyError` on turn 1 | Unescaped `{variable}` in `instruction` | ADK treats `{foo}` in `instruction` as a session-state placeholder. Replace `{foo}` with `[foo]`. |
 | Tool spinner hangs or stream dies mid-turn | Tool raised a Python exception | ADK tools must **never raise**; catch exceptions and return `json.dumps({"status": "ERROR", "error": str(exc)})`. Inspect container logs with `gcloud logging read 'resource.type="aiplatform.googleapis.com/ReasoningEngine"' --project=$GOOGLE_CLOUD_PROJECT --limit=20`. |
 | Deserialization error in Agent Runtime | Deployed from Python 3.13 instead of 3.12 | Run via `make deploy` (which uses `.venv/bin/python` on Python 3.12 and checks `sys.version_info[:2] == (3, 12)`). |
+| Deployed agent gets `403 Access Denied` reading/writing BigQuery (works locally in `make dev`) | Agent Runtime runs as `service-<PROJECT_NUMBER>@gcp-sa-aiplatform-re.iam.gserviceaccount.com` rather than your user ADC | Re-run `make deploy` (which auto-grants runtime roles when you have Project IAM Admin), or grant `roles/bigquery.dataEditor` and `roles/bigquery.jobUser` to `serviceAccount:service-<PROJECT_NUMBER>@gcp-sa-aiplatform-re.iam.gserviceaccount.com` with `gcloud projects add-iam-policy-binding`. |
 
 ---
 

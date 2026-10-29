@@ -336,3 +336,165 @@ def test_delete_targets_one_resource_and_keeps_unrelated_state(
 
     with pytest.raises(ValueError, match="full Agent Runtime resource name"):
         dele.delete_remote_agent("777", state_file=state)
+
+
+# ---------------------------------------------------------------------------
+# Agent Runtime service-agent IAM: deployed agents run as
+# service-<PROJECT_NUMBER>@gcp-sa-aiplatform-re.iam.gserviceaccount.com.
+# ---------------------------------------------------------------------------
+
+_RE_MEMBER = "serviceAccount:service-123456789@gcp-sa-aiplatform-re.iam.gserviceaccount.com"
+_RE_NUMERIC = "projects/123456789/locations/europe-west1/reasoningEngines/42"
+
+
+class _FakeResponse:
+    def __init__(self, payload: dict | None = None, status_code: int = 200) -> None:
+        self._payload = payload or {}
+        self.status_code = status_code
+
+    def json(self) -> dict:
+        return json.loads(json.dumps(self._payload))
+
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            raise RuntimeError(f"{self.status_code} Client Error: Forbidden")
+
+
+class _FakeIamSession:
+    def __init__(self, policy: dict) -> None:
+        self.policy = policy
+        self.calls: list[tuple[str, str]] = []
+        self.set_payloads: list[dict] = []
+
+    def get(self, url: str, **_: object) -> _FakeResponse:
+        self.calls.append(("GET", url))
+        return _FakeResponse({"projectNumber": "123456789"})
+
+    def post(self, url: str, **kwargs: object) -> _FakeResponse:
+        self.calls.append(("POST", url))
+        if url.endswith(":getIamPolicy"):
+            return _FakeResponse(self.policy)
+        raw_body = kwargs.get("json")
+        body = raw_body if isinstance(raw_body, dict) else {}
+        self.set_payloads.append(body)
+        return _FakeResponse(body.get("policy", {}))
+
+
+class _ForbiddenIamStub:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str]] = []
+
+    def raise_forbidden(self, project_id: str, resource_name: str) -> bool:
+        self.calls.append((project_id, resource_name))
+        raise RuntimeError("403 Client Error: Forbidden for url: ...:setIamPolicy")
+
+
+def test_ensure_reasoning_engine_iam_adds_missing_roles_additively(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Missing runtime roles are added; existing bindings, conditions, auditConfigs and etag are preserved."""
+    import deploy.deploy as dep
+
+    conditional = {
+        "role": "roles/bigquery.dataEditor",
+        "members": [_RE_MEMBER],
+        "condition": {"title": "temp", "expression": "request.time < timestamp('2030-01-01T00:00:00Z')"},
+    }
+    audit_configs = [{"service": "allServices", "auditLogConfigs": [{"logType": "ADMIN_READ"}]}]
+    policy = {
+        "version": 1,
+        "etag": "BwXyz123=",
+        "auditConfigs": audit_configs,
+        "bindings": [
+            {"role": "roles/owner", "members": ["user:alice@example.com"]},
+            {"role": "roles/bigquery.jobUser", "members": ["user:bob@example.com"]},
+            {"role": "roles/aiplatform.user", "members": [_RE_MEMBER]},
+            conditional,
+        ],
+    }
+    session = _FakeIamSession(policy)
+    monkeypatch.setattr(dep, "_authorized_session", lambda: session)
+
+    assert dep.ensure_reasoning_engine_iam("p1", "projects/p1/locations/europe-west1/reasoningEngines/42")
+    assert session.calls[0] == ("GET", "https://cloudresourcemanager.googleapis.com/v1/projects/p1")
+    assert session.calls[-1] == ("POST", "https://cloudresourcemanager.googleapis.com/v1/projects/p1:setIamPolicy")
+    assert len(session.set_payloads) == 1
+    sent = session.set_payloads[0]["policy"]
+    assert sent["etag"] == "BwXyz123="
+    assert sent["version"] == 3  # conditional binding present -> v3 required
+    assert sent["auditConfigs"] == audit_configs
+    bindings = sent["bindings"]
+    assert {"role": "roles/owner", "members": ["user:alice@example.com"]} in bindings
+    assert conditional in bindings  # untouched, and does NOT count as the grant
+    assert {"role": "roles/bigquery.jobUser", "members": ["user:bob@example.com", _RE_MEMBER]} in bindings
+    for role in dep.REASONING_ENGINE_RUNTIME_ROLES:
+        assert any(
+            b["role"] == role and "condition" not in b and _RE_MEMBER in b["members"] for b in bindings
+        ), role
+    assert len(bindings) == 6  # 4 original + new unconditional dataEditor + storage.objectAdmin
+
+
+def test_ensure_reasoning_engine_iam_is_noop_when_roles_present(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """All four roles already bound unconditionally: setIamPolicy is never called."""
+    import deploy.deploy as dep
+
+    policy = {
+        "etag": "BwAbc=",
+        "bindings": [{"role": role, "members": [_RE_MEMBER]} for role in dep.REASONING_ENGINE_RUNTIME_ROLES],
+    }
+    session = _FakeIamSession(policy)
+    monkeypatch.setattr(dep, "_authorized_session", lambda: session)
+
+    assert dep.ensure_reasoning_engine_iam("p1", _RE_NUMERIC) is True
+    assert session.set_payloads == []
+    # Numeric project in the resource name: no projectNumber lookup either.
+    assert [c[0] for c in session.calls] == ["POST"]
+    assert "Verified BigQuery/Vertex/Storage IAM roles" in capsys.readouterr().out
+
+
+def test_deploy_survives_iam_permission_denied(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A 403 from the IAM helper prints a NOTE with the gcloud fix but never fails make deploy."""
+    import deploy.deploy as dep
+
+    fake = _FakeAgentEngines()
+    state = _prepare_deploy(monkeypatch, tmp_path, fake)
+    monkeypatch.setattr(dep, "check_adc", lambda _project: None)
+    monkeypatch.setattr(dep, "_assert_staging_bucket", lambda *_: None)
+    stub = _ForbiddenIamStub()
+    monkeypatch.setattr(dep, "ensure_reasoning_engine_iam", stub.raise_forbidden)
+
+    name = dep.deploy_agent(pack_id="t00_example", state_file=state, check_bucket=True)
+    assert name == _SAVED
+    assert stub.calls == [("p1", _SAVED)]
+    assert json.loads(state.read_text(encoding="utf-8"))["resource_name"] == _SAVED
+    out = capsys.readouterr().out
+    assert "[deploy] NOTE:" in out
+    assert "gcloud projects add-iam-policy-binding p1" in out
+    assert "roles/bigquery.dataEditor" in out and "roles/bigquery.jobUser" in out
+
+
+def test_explain_gcp_error_bigquery_403_mentions_agent_runtime_service_agent() -> None:
+    """A BigQuery 403 hint keeps the generic guidance and names the gcp-sa-aiplatform-re fix."""
+    from app.preflight import explain_gcp_error
+
+    hint = explain_gcp_error(
+        RuntimeError(
+            "403 POST https://bigquery.googleapis.com/bigquery/v2/projects/p1/jobs: Access Denied: "
+            "Project p1: User does not have bigquery.jobs.create permission in project p1."
+        ),
+        "p1",
+    )
+    assert "Permission denied in project 'p1'" in hint
+    assert "gcp-sa-aiplatform-re.iam.gserviceaccount.com" in hint
+    assert "roles/bigquery.dataEditor" in hint and "roles/bigquery.jobUser" in hint
+    table_hint = explain_gcp_error(
+        RuntimeError("403 Access Denied: Table p1:seed_t00.menu: User does not have permission"),
+        "p1",
+    )
+    assert "gcp-sa-aiplatform-re.iam.gserviceaccount.com" in table_hint
+    generic = explain_gcp_error(RuntimeError("403 PERMISSION_DENIED: storage.objects.get"), "p1")
+    assert "Permission denied" in generic and "gcp-sa-aiplatform-re" not in generic
